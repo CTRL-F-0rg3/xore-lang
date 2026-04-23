@@ -68,16 +68,7 @@ pub enum LexerError {
     InvalidNumber(Pos),
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum Token {
-    // ... Twoje poprzednie tokeny ...
-    Error(LexerError),
-    Identifier(String),
-    IntLiteral(i128),
-    FloatLiteral(f64),
-    StrLiteral(String),
-    EOF,
-}
+
 
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
