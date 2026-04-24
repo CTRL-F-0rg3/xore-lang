@@ -1,0 +1,42 @@
+// komentarz .xr
+public main(){
+    println!("data");
+
+    let x = String.new();
+    let y = String.new();
+
+    let z = bool(False);
+    if [x == y]{
+        z %= True;
+
+    }
+    else {
+        println!(None);
+    }
+
+    while z {
+        println!("".{}.x);
+
+
+        end() if y == i32(23);
+    }
+
+    for in i range (30){
+        println!(y);
+
+        end()
+    }
+
+    fn new() -> Self {
+        new.data(x);
+        enum data {
+
+            SELF,
+            HOST,
+        }
+
+
+    }
+
+
+}

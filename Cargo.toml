@@ -3,4 +3,14 @@ name = "xore-lang"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[[bin]]
+name = "xore-lexer"
+path = "src/main.rs"
+ 
+[lib]
+name = "xore_lexer"
+path = "src/lib.rs"
+ 
+[dev-dependencies]
+pretty_assertions = "1.4"
+ 
