@@ -1,3 +1,4 @@
-fn main() {
-    println!("Hello, world!");
+mod lexer;
+fn main(){
+    println!("997211")
 }

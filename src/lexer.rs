@@ -2,60 +2,6 @@ use std::iter::Peekable;
 use std::str::Chars;
 
 #[derive(Debug, PartialEq, Clone)]
-
-pub enum Token {
-    I32, I64, I128, I256,
-    STRING, S_STRING, BOOL,
-
-
-    PUBLIC, PRIVATE, 
-    FN, ENUM, STRUCT,
-    IF, ELSE, 
-    SWITCH, CASE, DEFAULT, 
-    FOR, WHILE, 
-    RETURN, LET, MUT,
-
-    ADD,      // +
-    MINUS,    // -
-    STAR,     // *
-    SLASH,    // /
-    PERCENT,  // %
-
-    ASSIGN,   // =
-    EQ,       // ==
-    NOT_EQ,   // !=
-    LT,       // <
-    GT,       // >
-    LTE,      // <=
-    GTE,      // >=
-    AND,      // &&
-    OR,       // ||
-    NOT,      // !
-
-    L_PAREN,    // (
-    R_PAREN,    // )
-    L_BRACE,    // {
-    R_BRACE,    // }
-    L_BRACKET,  // [
-    R_BRACKET,  // ]
-    COMMA,      // ,
-    DOT,        // .
-    COLON,      // :
-    SEMICOLON,  // ;
-    ARROW,      // ->
-
-    
-    Identifier(String),
-    IntLiteral(i128),
-    StrLiteral(String),
-    BoolLiteral(bool),
-
-    EOF,
-}
-
-
-
-#[derive(Debug, PartialEq, Clone)]
 pub struct Pos {
     pub line: usize,
     pub col: usize,
@@ -68,7 +14,30 @@ pub enum LexerError {
     InvalidNumber(Pos),
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub enum Token {
+    I32, I64, I128, I256,
+    String, SString, Bool, // Poprawione na CamelCase żeby nie było warningów
+    Public, Private, 
+    Fn, Enum, Struct,
+    If, Else, Switch, Case, Default, 
+    For, While, Return, Let, Mut,
 
+    Add, Minus, Star, Slash, Percent,
+    Assign, Eq, NotEq, Lt, Gt, Lte, Gte,
+    And, Or, Not,
+
+    LParen, RParen, LBrace, RBrace, LBracket, RBracket,
+    Comma, Dot, Colon, Semicolon, Arrow,
+
+    Identifier(String),
+    IntLiteral(i128),
+    FloatLiteral(f64),
+    StrLiteral(String),
+    BoolLiteral(bool),
+    Error(LexerError), // To było brakujące!
+    EOF,
+}
 
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
@@ -102,7 +71,6 @@ impl<'a> Lexer<'a> {
 
     pub fn next_token(&mut self) -> Token {
         self.skip_whitespace_and_comments();
-
         let pos = Pos { line: self.line, col: self.col };
         
         let ch = match self.next_char() {
@@ -111,24 +79,28 @@ impl<'a> Lexer<'a> {
         };
 
         match ch {
-            '+' => Token::ADD,
-            '*' => Token::STAR,
-            '/' => Token::SLASH,
-            '%' => Token::PERCENT,
-            '(' => Token::L_PAREN,
-            ')' => Token::R_PAREN,
-            '{' => Token::L_BRACE,
-            '}' => Token::R_BRACE,
-            ',' => Token::COMMA,
-            ';' => Token::SEMICOLON,
+            '+' => Token::Add,
+            '*' => Token::Star,
+            '/' => Token::Slash,
+            '%' => Token::Percent,
+            '(' => Token::LParen,
+            ')' => Token::RParen,
+            '{' => Token::LBrace,
+            '}' => Token::RBrace,
+            '[' => Token::LBracket,
+            ']' => Token::RBracket,
+            ',' => Token::Comma,
+            '.' => Token::Dot,
+            ':' => Token::Colon,
+            ';' => Token::Semicolon,
 
-            '-' => if self.consume_if('>') { Token::ARROW } else { Token::MINUS },
-            '=' => if self.consume_if('=') { Token::EQ } else { Token::ASSIGN },
-            '!' => if self.consume_if('=') { Token::NOT_EQ } else { Token::NOT },
-            '<' => if self.consume_if('=') { Token::LTE } else { Token::LT },
-            '>' => if self.consume_if('=') { Token::GTE } else { Token::GT },
-            '&' => if self.consume_if('&') { Token::AND } else { Token::Error(LexerError::UnexpectedChar('&', pos)) },
-            '|' => if self.consume_if('|') { Token::OR } else { Token::Error(LexerError::UnexpectedChar('|', pos)) },
+            '-' => if self.consume_if('>') { Token::Arrow } else { Token::Minus },
+            '=' => if self.consume_if('=') { Token::Eq } else { Token::Assign },
+            '!' => if self.consume_if('=') { Token::NotEq } else { Token::Not },
+            '<' => if self.consume_if('=') { Token::Lte } else { Token::Lt },
+            '>' => if self.consume_if('=') { Token::Gte } else { Token::Gt },
+            '&' => if self.consume_if('&') { Token::And } else { Token::Error(LexerError::UnexpectedChar('&', pos)) },
+            '|' => if self.consume_if('|') { Token::Or } else { Token::Error(LexerError::UnexpectedChar('|', pos)) },
 
             '"' => self.lex_string(pos),
 
@@ -139,22 +111,54 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    fn lex_identifier(&mut self, first: char) -> Token {
+        let mut id = first.to_string();
+        while let Some(&c) = self.peek_char() {
+            if c.is_alphanumeric() || c == '_' {
+                id.push(self.next_char().unwrap());
+            } else { break; }
+        }
+
+        match id.as_str() {
+            "i32" => Token::I32,
+            "i64" => Token::I64,
+            "i128" => Token::I128,
+            "i256" => Token::I256,
+            "String" => Token::String,
+            "str" => Token::SString,
+            "bool" => Token::Bool,
+            "public" => Token::Public,
+            "private" => Token::Private,
+            "fn" => Token::Fn,
+            "enum" => Token::Enum,
+            "struct" => Token::Struct,
+            "if" => Token::If,
+            "else" => Token::Else,
+            "switch" => Token::Switch,
+            "case" => Token::Case,
+            "default" => Token::Default,
+            "for" => Token::For,
+            "while" => Token::While,
+            "return" => Token::Return,
+            "let" => Token::Let,
+            "mut" => Token::Mut,
+            "true" => Token::BoolLiteral(true),
+            "false" => Token::BoolLiteral(false),
+            _ => Token::Identifier(id),
+        }
+    }
+
     fn lex_number(&mut self, first: char, pos: Pos) -> Token {
         let mut s = first.to_string();
         let mut is_float = false;
-
         while let Some(&c) = self.peek_char() {
             if c.is_ascii_digit() || c == '_' {
-                if c != '_' { s.push(c); }
-                self.next_char();
+                if c != '_' { s.push(self.next_char().unwrap()); } else { self.next_char(); }
             } else if c == '.' && !is_float {
                 is_float = true;
                 s.push(self.next_char().unwrap());
-            } else {
-                break;
-            }
+            } else { break; }
         }
-
         if is_float {
             s.parse::<f64>().map(Token::FloatLiteral).unwrap_or(Token::Error(LexerError::InvalidNumber(pos)))
         } else {
@@ -186,7 +190,6 @@ impl<'a> Lexer<'a> {
             if c.is_whitespace() {
                 self.next_char();
             } else if c == '/' {
-                // Podglądamy czy to komentarz bez zjadania '/'
                 if self.nth_char_is(1, '/') {
                     while let Some(nc) = self.next_char() {
                         if nc == '\n' { break; }
