@@ -126,6 +126,15 @@ pub enum Keyword {
     True,
     False,
     Null,
+
+    // ── Xore-specific ──────────────────────────────────────────────────────
+    Public,
+    Private,
+    End,
+    Range,
+    In,
+    SelfType,   // Self (type-level)
+    SelfValue,  // self (value-level)
 }
 
 impl Keyword {
@@ -159,7 +168,10 @@ impl Keyword {
             F32 => "f32", F64 => "f64",
             Usize => "usize", Isize => "isize",
             Bool => "bool", Void => "void", Char => "char", Anytype => "anytype",
-            True => "true", False => "false", Null => "null",
+            True => "True", False => "False", Null => "None",
+            Public => "public", Private => "private",
+            End => "end", Range => "range", In => "in",
+            SelfType => "Self", SelfValue => "self",
         }
     }
 
@@ -192,6 +204,9 @@ impl Keyword {
             F32 | F64 | Usize | Isize |
             Bool | Void | Char | Anytype |
             True | False | Null => KeywordGroup::Type,
+
+            Public | Private | End | Range | In |
+            SelfType | SelfValue => KeywordGroup::Core,
         }
     }
 }

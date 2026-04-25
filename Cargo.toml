@@ -1,16 +1,16 @@
 [package]
 name = "xore-lang"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "Xore language compiler — lexer + parser + codegen"
 
 [[bin]]
-name = "xore-lexer"
+name = "xore"
 path = "src/main.rs"
- 
+
 [lib]
-name = "xore_lexer"
+name = "xore_lang"
 path = "src/lib.rs"
- 
+
 [dev-dependencies]
 pretty_assertions = "1.4"
- 

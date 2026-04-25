@@ -109,10 +109,22 @@ pub fn lookup(word: &str) -> Option<Keyword> {
         "char"        => Some(Keyword::Char),
         "anytype"     => Some(Keyword::Anytype),
 
-        // ── Boolean / null literals that are keywords ──────────────────────
-        "true"        => Some(Keyword::True),
-        "false"       => Some(Keyword::False),
-        "null"        => Some(Keyword::Null),
+        // ── Boolean / null literals (Xore uses capitalised forms) ─────────
+        "True"        => Some(Keyword::True),
+        "False"       => Some(Keyword::False),
+        "true"        => Some(Keyword::True),   // lowercase alias
+        "false"       => Some(Keyword::False),  // lowercase alias
+        "None"        => Some(Keyword::Null),
+        "null"        => Some(Keyword::Null),   // lowercase alias
+
+        // ── Xore-specific keywords ─────────────────────────────────────────
+        "public"      => Some(Keyword::Public),
+        "private"     => Some(Keyword::Private),
+        "end"         => Some(Keyword::End),
+        "range"       => Some(Keyword::Range),
+        "in"          => Some(Keyword::In),
+        "Self"        => Some(Keyword::SelfType),
+        "self"        => Some(Keyword::SelfValue),
 
         _ => None,
     }
