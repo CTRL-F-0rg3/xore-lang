@@ -2,7 +2,7 @@
 name = "xore-lang"
 version = "0.1.0"
 edition = "2021"
-description = "Xore language compiler — lexer + parser + codegen"
+description = "Xore language compiler and build system"
 
 [[bin]]
 name = "xore"

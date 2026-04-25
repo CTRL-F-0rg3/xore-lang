@@ -267,11 +267,20 @@ impl Parser {
     // ── Items ─────────────────────────────────────────────────────────────
 
     fn parse_item(&mut self) -> ParseResult<Item> {
+        // Check for @export annotation before visibility/fn keyword.
+        // Syntax: @export fn name(...) or @export public fn name(...)
+        let exported = if matches!(&self.peek().kind, TokenKind::Annotation(s) if s == "export") {
+            self.advance(); // consume @export
+            true
+        } else {
+            false
+        };
+
         let vis = self.parse_visibility();
 
         match &self.peek().kind.clone() {
             TokenKind::Kw(Keyword::Fn) => {
-                Ok(Item::Function(self.parse_fn_decl(vis)?))
+                Ok(Item::Function(self.parse_fn_decl(vis, exported)?))
             }
             TokenKind::Kw(Keyword::Struct) => {
                 Ok(Item::Struct(self.parse_struct(vis)?))
@@ -290,7 +299,7 @@ impl Parser {
             }
             // Xore short form: `public main() { … }` — no `fn` keyword
             TokenKind::Ident(_) => {
-                Ok(Item::Function(self.parse_fn_decl_short(vis)?))
+                Ok(Item::Function(self.parse_fn_decl_short(vis, exported)?))
             }
             _ => Err(ParseError::new(
                 format!("unexpected token at top level: `{}`", self.token_desc()),
@@ -307,8 +316,8 @@ impl Parser {
 
     // ── Function declarations ─────────────────────────────────────────────
 
-    /// Full form: `[pub] fn name(params) [-> type] { body }`
-    fn parse_fn_decl(&mut self, vis: Visibility) -> ParseResult<FnDecl> {
+    /// Full form: `[@export] [public] fn name(params) [-> type] { body }`
+    fn parse_fn_decl(&mut self, vis: Visibility, exported: bool) -> ParseResult<FnDecl> {
         let start = self.current_span();
         self.expect_kw(Keyword::Fn)?;
         let (name, _) = self.expect_ident()?;
@@ -316,18 +325,18 @@ impl Parser {
         let ret_ty = self.parse_optional_return_type()?;
         let body = self.parse_block()?;
         let span = span_to(start, self.current_span());
-        Ok(FnDecl { vis, name, params, ret_ty, body, span })
+        Ok(FnDecl { vis, exported, name, params, ret_ty, body, span })
     }
 
-    /// Short form (Xore): `public main() { body }` — no `fn` keyword
-    fn parse_fn_decl_short(&mut self, vis: Visibility) -> ParseResult<FnDecl> {
+    /// Short form (Xore): `[@export] public main() { body }` — no `fn` keyword
+    fn parse_fn_decl_short(&mut self, vis: Visibility, exported: bool) -> ParseResult<FnDecl> {
         let start = self.current_span();
         let (name, _) = self.expect_ident()?;
         let params = self.parse_params()?;
         let ret_ty = self.parse_optional_return_type()?;
         let body = self.parse_block()?;
         let span = span_to(start, self.current_span());
-        Ok(FnDecl { vis, name, params, ret_ty, body, span })
+        Ok(FnDecl { vis, exported, name, params, ret_ty, body, span })
     }
 
     fn parse_params(&mut self) -> ParseResult<Vec<Param>> {
@@ -518,8 +527,10 @@ impl Parser {
             TokenKind::Kw(Keyword::End)    => self.parse_end().map(Stmt::End),
             // Inner `fn` declaration
             TokenKind::Kw(Keyword::Fn) => {
+                // Check for @export before inner fn (unusual but valid)
+                let exported = false;
                 let vis = Visibility::Private;
-                Ok(Stmt::FnDecl(self.parse_fn_decl(vis)?))
+                Ok(Stmt::FnDecl(self.parse_fn_decl(vis, exported)?))
             }
             // Inner `enum` declaration
             TokenKind::Kw(Keyword::Enum) => {

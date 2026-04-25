@@ -16,7 +16,6 @@
 //   - We can later swap to direct x86-64 emission for a self-hosted backend
 
 use crate::ast::*;
-
 // ─── LLVM types ──────────────────────────────────────────────────────────────
 
 /// Maps a Xore type name to its LLVM IR type string.
@@ -129,11 +128,16 @@ impl Codegen {
 
     /// Walk the whole program and return the complete IR text.
     pub fn emit_program(&mut self, program: &Program) -> String {
+        self.emit_program_with_target(program, "x86_64-unknown-linux-gnu")
+    }
+
+    /// Same as emit_program but with an explicit LLVM target triple.
+    pub fn emit_program_with_target(&mut self, program: &Program, triple: &str) -> String {
         // LLVM module header
         self.emit(&format!("; Xore compiler v0.1.0 — module: {}", self.module));
         self.emit(&format!("source_filename = \"{}\"", self.module));
         self.emit("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"");
-        self.emit("target triple = \"x86_64-unknown-linux-gnu\"");
+        self.emit(&format!("target triple = \"{triple}\""));
         self.emit("");
 
         // Declare external libc functions we may need
@@ -235,10 +239,17 @@ impl Codegen {
             .map(|p| format!("{} noundef %{}", llvm_type(&p.ty), p.name))
             .collect();
 
-        // Linkage: public → external, private → internal
-        let linkage = match f.vis {
-            Visibility::Public  => "",
-            Visibility::Private => "internal ",
+        // Linkage rules:
+        //   @export           → external (visible to linker / other .libx files)
+        //   public (no export)→ external (visible within same binary)
+        //   private           → internal (dead-code-eliminated if unused)
+        let linkage = if f.exported {
+            ""          // default external — visible to linker
+        } else {
+            match f.vis {
+                Visibility::Public  => "",
+                Visibility::Private => "internal ",
+            }
         };
 
         self.emit(&format!(

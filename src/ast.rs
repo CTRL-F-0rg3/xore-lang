@@ -64,12 +64,13 @@ pub enum TypeExpr {
 
 #[derive(Debug, Clone)]
 pub struct FnDecl {
-    pub vis:     Visibility,
-    pub name:    String,
-    pub params:  Vec<Param>,
-    pub ret_ty:  Option<TypeExpr>,
-    pub body:    Block,
-    pub span:    Span,
+    pub vis:      Visibility,
+    pub exported: bool,      // @export annotation present
+    pub name:     String,
+    pub params:   Vec<Param>,
+    pub ret_ty:   Option<TypeExpr>,
+    pub body:     Block,
+    pub span:     Span,
 }
 
 #[derive(Debug, Clone)]
