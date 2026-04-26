@@ -380,13 +380,7 @@ impl Codegen {
         // Condition
         let cond_val = self.emit_expr(&i.cond, env);
         let cond_ty  = infer_expr_type(&i.cond, env);
-        let cond_i1  = if cond_ty == "i1" {
-            cond_val
-        } else {
-            let t = self.tmp();
-            self.emit(&format!("  {t} = trunc {cond_ty} {cond_val} to i1"));
-            t
-        };
+        let cond_i1  = to_bool_cond(self, cond_val, &cond_ty);
         self.emit(&format!("  br i1 {cond_i1}, label %{then_lbl}, label %{else_lbl}"));
 
         // Then branch
@@ -421,13 +415,7 @@ impl Codegen {
         self.emit(&format!("{cond_lbl}:"));
         let cond_val = self.emit_expr(&w.cond, env);
         let cond_ty  = infer_expr_type(&w.cond, env);
-        let cond_i1  = if cond_ty == "i1" {
-            cond_val
-        } else {
-            let t = self.tmp();
-            self.emit(&format!("  {t} = trunc {cond_ty} {cond_val} to i1"));
-            t
-        };
+        let cond_i1  = to_bool_cond(self, cond_val, &cond_ty);
         self.emit(&format!("  br i1 {cond_i1}, label %{body_lbl}, label %{end_lbl}"));
 
         self.emit(&format!("{body_lbl}:"));
@@ -492,13 +480,7 @@ impl Codegen {
                 let after    = self.label("after_end");
                 let cond_val = self.emit_expr(cond_expr, env);
                 let cond_ty  = infer_expr_type(cond_expr, env);
-                let cond_i1  = if cond_ty == "i1" {
-                    cond_val
-                } else {
-                    let t = self.tmp();
-                    self.emit(&format!("  {t} = trunc {cond_ty} {cond_val} to i1"));
-                    t
-                };
+                let cond_i1  = to_bool_cond(self, cond_val, &cond_ty);
                 self.emit(&format!("  br i1 {cond_i1}, label %{break_lbl}, label %{after}"));
                 self.emit(&format!("{after}:"));
             }
@@ -1022,7 +1004,23 @@ fn assign_op_instr(op: AssignOp) -> &'static str {
     }
 }
 
-/// Choose the right LLVM cast instruction to go from `from_ty` to `to_ty`.
+/// Convert an expression value to i1 for use as a branch condition.
+/// Uses `icmp ne T val, 0` for integer types instead of `trunc` — this
+/// correctly handles all even numbers (trunc i64 2 to i1 = 0, which is wrong).
+fn to_bool_cond(out: &mut Codegen, val: String, ty: &str) -> String {
+    if ty == "i1" {
+        return val;
+    }
+    if ty == "float" || ty == "double" {
+        let t = out.tmp();
+        out.emit(&format!("  {t} = fcmp one {ty} {val}, 0.0"));
+        return t;
+    }
+    // For all integer types: icmp ne ty val, 0
+    let t = out.tmp();
+    out.emit(&format!("  {t} = icmp ne {ty} {val}, 0"));
+    t
+}
 fn pick_cast(from_ty: &str, to_ty: &str) -> &'static str {
     match (from_ty, to_ty) {
         // Widen int
