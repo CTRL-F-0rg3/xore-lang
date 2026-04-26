@@ -525,9 +525,10 @@ impl Parser {
             TokenKind::Kw(Keyword::While)  => self.parse_while().map(Stmt::While),
             TokenKind::Kw(Keyword::For)    => self.parse_for().map(Stmt::For),
             TokenKind::Kw(Keyword::End)    => self.parse_end().map(Stmt::End),
+            TokenKind::Kw(Keyword::Match)  => self.parse_match().map(Stmt::Match),
+            TokenKind::Kw(Keyword::Switch) => self.parse_switch().map(Stmt::Switch),
             // Inner `fn` declaration
             TokenKind::Kw(Keyword::Fn) => {
-                // Check for @export before inner fn (unusual but valid)
                 let exported = false;
                 let vis = Visibility::Private;
                 Ok(Stmt::FnDecl(self.parse_fn_decl(vis, exported)?))
@@ -659,6 +660,115 @@ impl Parser {
         };
         self.eat_punct(Punct::Semicolon);
         Ok(EndStmt { cond, span: span_to(start, self.current_span()) })
+    }
+
+    // ── match ─────────────────────────────────────────────────────────────
+    // Syntax:
+    //   match expr {
+    //       pattern => { body }
+    //       pattern => { body }
+    //   }
+
+    fn parse_match(&mut self) -> ParseResult<MatchStmt> {
+        let start = self.current_span();
+        self.expect_kw(Keyword::Match)?;
+        let subject = self.parse_expr()?;
+        self.expect_delim(Delim::OpenBrace)?;
+
+        let mut arms = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::Delim(Delim::CloseBrace) | TokenKind::Eof) {
+            let arm_start = self.current_span();
+            let pattern = self.parse_pattern()?;
+            self.expect_op(Op::FatArrow)?;
+            let body = self.parse_block()?;
+            self.eat_punct(Punct::Comma);
+            arms.push(MatchArm { pattern, body, span: span_to(arm_start, self.current_span()) });
+        }
+
+        self.expect_delim(Delim::CloseBrace)?;
+        Ok(MatchStmt { subject, arms, span: span_to(start, self.current_span()) })
+    }
+
+    fn parse_pattern(&mut self) -> ParseResult<Pattern> {
+        let tok = self.peek().clone();
+        // Wildcard: _
+        if let TokenKind::Ident(ref name) = tok.kind {
+            if name == "_" {
+                self.advance();
+                return Ok(Pattern::Wildcard);
+            }
+        }
+        // Binding or variant: name or EnumName.Variant
+        if let TokenKind::Ident(ref name) = tok.kind {
+            let name = name.clone();
+            self.advance();
+            // Check for Enum.Variant pattern
+            if self.eat_op(Op::Dot) {
+                let (variant, _) = self.expect_ident()?;
+                return Ok(Pattern::Variant(name, Some(variant)));
+            }
+            // Could be a binding (lowercase) or a variant (uppercase first char)
+            let is_variant = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+            if is_variant {
+                return Ok(Pattern::Variant(name, None));
+            }
+            return Ok(Pattern::Bind(name));
+        }
+        // Literal pattern
+        let expr = self.parse_expr()?;
+        Ok(Pattern::Lit(expr))
+    }
+
+    // ── switch ────────────────────────────────────────────────────────────
+    // Syntax:
+    //   switch expr {
+    //       case val: { body }
+    //       case val2: { body }
+    //       default: { body }
+    //   }
+
+    fn parse_switch(&mut self) -> ParseResult<SwitchStmt> {
+        let start = self.current_span();
+        self.expect_kw(Keyword::Switch)?;
+        let subject = self.parse_expr()?;
+        self.expect_delim(Delim::OpenBrace)?;
+
+        let mut cases   = Vec::new();
+        let mut default = None;
+
+        while !matches!(self.peek().kind, TokenKind::Delim(Delim::CloseBrace) | TokenKind::Eof) {
+            let case_start = self.current_span();
+
+            // `default:` branch
+            if let TokenKind::Ident(ref s) = self.peek().kind.clone() {
+                if s == "default" {
+                    self.advance();
+                    self.expect_punct(Punct::Colon)?;
+                    default = Some(self.parse_block()?);
+                    continue;
+                }
+            }
+
+            // `case val:` branch
+            self.expect_kw(Keyword::Const).or_else(|_| {
+                // `case` isn't a keyword yet — check ident "case"
+                if let TokenKind::Ident(ref s) = self.peek().kind.clone() {
+                    if s == "case" { self.advance(); return Ok(self.current_span()); }
+                }
+                Err(ParseError::new("expected `case`", self.current_span()))
+            })?;
+
+            let value = self.parse_expr()?;
+            self.expect_punct(Punct::Colon)?;
+            let body = self.parse_block()?;
+            cases.push(SwitchCase {
+                value, body,
+                span: span_to(case_start, self.current_span()),
+            });
+        }
+
+        self.expect_delim(Delim::CloseBrace)?;
+        Ok(SwitchStmt { subject, cases, default, span: span_to(start, self.current_span()) })
     }
 
     // ── Expression statement ──────────────────────────────────────────────

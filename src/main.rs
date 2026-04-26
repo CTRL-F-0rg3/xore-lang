@@ -7,17 +7,19 @@
 //   xore check                          parse + typecheck only
 //   xore clean                          remove build/
 //   xore version                        print compiler version
-//   xore --tokens <file.xr>             dump token stream
-//   xore --ast    <file.xr>             dump AST
-//   xore --ir     <file.xr>             dump LLVM IR
+//   xore --tokens <file.xre>             dump token stream
+//   xore --ast    <file.xre>             dump AST
+//   xore --ir     <file.xre>             dump LLVM IR
 
 use std::{env, fs, path::{Path, PathBuf}, process};
 
 use xore_lang::ast::*;
 use xore_lang::codegen::Codegen;
+use xore_lang::libx::LibxWriter;
 use xore_lang::project::{
     collect_sources, scaffold_project, Manifest, OptLevel, ProjectType, SourceUnit, Target,
 };
+use xore_lang::typeck::TypeChecker;
 use xore_lang::{lex, parse, KeywordGroup, NumBase, TokenKind};
 
 const VERSION: &str = "0.1.0";
@@ -82,12 +84,12 @@ fn print_help() {
     println!("  xore version                 print version");
     println!();
     println!("DEBUG:");
-    println!("  xore --tokens <file.xr>      dump token stream");
-    println!("  xore --ast    <file.xr>      dump AST");
-    println!("  xore --ir     <file.xr>      dump generated LLVM IR");
+    println!("  xore --tokens <file.xre>      dump token stream");
+    println!("  xore --ast    <file.xre>      dump AST");
+    println!("  xore --ir     <file.xre>      dump generated LLVM IR");
     println!();
     println!("SOURCE FILES:");
-    println!("  .xr    regular source file");
+    println!("  .xre    regular source file");
     println!("  .xrs   module spec  (interface — critical modules require both)");
     println!("  .xrb   module body  (implementation — critical modules require both)");
     println!();
@@ -100,7 +102,7 @@ fn print_help() {
 fn cmd_version() {
     println!("xore {VERSION}");
     println!("target: x86_64-linux | x86_64-windows | bare-metal");
-    println!("formats: .xr .xrs .xrb → native binary | .libx | .elf");
+    println!("formats: .xre .xrs .xrb → native binary | .libx | .elf");
 }
 
 // ─── xore new ────────────────────────────────────────────────────────────────
@@ -122,7 +124,7 @@ fn cmd_new(name: &str, ty: ProjectType) {
     };
     println!("  created  {name}/");
     println!("  created  {name}/xore.project");
-    println!("  created  {name}/src/main.xr");
+    println!("  created  {name}/src/main.xre");
     println!("  created  {name}/.gitignore");
     println!();
     println!("✓ new {type_label} project `{name}`");
@@ -168,10 +170,17 @@ fn cmd_check() {
 
 fn check_file(path: &Path) -> usize {
     let src = read_file(path.to_str().unwrap_or("?"));
-    let (_, lex_errs, parse_errs) = parse(&src);
-    let n = lex_errs.len() + parse_errs.len();
+    let (prog, lex_errs, parse_errs) = parse(&src);
+
+    let mut n = lex_errs.len() + parse_errs.len();
     for e in &lex_errs   { eprintln!("  lex   {}:{e}", path.display()); }
     for e in &parse_errs { eprintln!("  parse {}:{e}", path.display()); }
+
+    // Type checker pass
+    let mut tc = TypeChecker::new();
+    tc.check_program(&prog);
+    for e in &tc.errors { eprintln!("  type  {}:{e}", path.display()); }
+    n += tc.errors.len();
     n
 }
 
@@ -220,11 +229,16 @@ fn cmd_build(release: bool, force_elf: bool) -> PathBuf {
     let output = manifest.output_path();
     link_objects(&obj_files, &output, &manifest);
 
+    // For library projects — also package as .libx
+    if manifest.ty == ProjectType::Lib {
+        package_libx(&obj_files, &manifest);
+    }
+
     println!("✓ built {} → {}", manifest.name, output.display());
     output
 }
 
-/// Compile one source file: .xr or .xrb → LLVM IR → object file.
+/// Compile one source file: .xre or .xrb → LLVM IR → object file.
 fn compile_unit(path: &Path, build_dir: &Path, manifest: &Manifest) -> Option<PathBuf> {
     let src = read_file(path.to_str().unwrap_or("?"));
     let (program, lex_errs, parse_errs) = parse(&src);
@@ -235,13 +249,20 @@ fn compile_unit(path: &Path, build_dir: &Path, manifest: &Manifest) -> Option<Pa
         process::exit(1);
     }
 
+    // Type checker
+    let mut tc = TypeChecker::new();
+    tc.check_program(&program);
+    if !tc.errors.is_empty() {
+        for e in &tc.errors { eprintln!("  type  {}:{e}", path.display()); }
+        process::exit(1);
+    }
+
     let stem = path.file_stem()?.to_str()?;
     let ll_path  = build_dir.join(format!("{stem}.ll"));
     let obj_path = build_dir.join(format!("{stem}.o"));
 
     // Generate LLVM IR
     let mut cg = Codegen::new(path.to_str().unwrap_or("?"));
-    // Override target triple from manifest
     let ir = cg.emit_program_with_target(&program, manifest.target.llvm_triple());
 
     fs::write(&ll_path, &ir).unwrap_or_else(|e| fatal(&format!("write IR: {e}")));
@@ -357,6 +378,74 @@ fn link_objects(objs: &[PathBuf], output: &Path, manifest: &Manifest) {
     }
 }
 
+/// Package compiled objects + type info into a .libx archive.
+fn package_libx(objs: &[PathBuf], manifest: &Manifest) {
+    let libx_path = manifest.build_dir()
+        .join(format!("{}.libx", manifest.name));
+
+    let mut writer = LibxWriter::new(&manifest.name, manifest.target.llvm_triple());
+
+    // Add all object files
+    for obj in objs {
+        if let Err(e) = writer.add_object_file(obj) {
+            eprintln!("  warning: libx: could not add {}: {e}", obj.display());
+        }
+    }
+
+    // Collect exported signatures from source files
+    let src_dir = manifest.root.join("src");
+    if let Ok(units) = collect_sources(&src_dir) {
+        for unit in &units {
+            let path = match unit {
+                SourceUnit::Single(p)       => p.clone(),
+                SourceUnit::Module { body, .. } => body.clone(),
+            };
+            let src = fs::read_to_string(&path).unwrap_or_default();
+            let (prog, _, _) = parse(&src);
+
+            // Collect @export functions → add to SIGS section
+            for item in &prog.items {
+                if let Item::Function(f) = item {
+                    if f.exported {
+                        let params: Vec<String> = f.params.iter()
+                            .map(|p| format!("{}", p.name))
+                            .collect();
+                        let ret = f.ret_ty.as_ref()
+                            .map(|t| match t {
+                                TypeExpr::Named(n, _) => n.clone(),
+                                TypeExpr::Void(_)     => "void".into(),
+                                _ => "ptr".into(),
+                            })
+                            .unwrap_or_else(|| "void".into());
+                        writer.add_sig(xore_lang::libx::FnSig {
+                            name: f.name.clone(), params, ret,
+                        });
+                    }
+                }
+                // Collect structs and enums
+                if let Item::Struct(s) = item {
+                    let fields: Vec<(&str, &str)> = s.fields.iter()
+                        .map(|f| (f.name.as_str(), "i64"))  // simplified type for now
+                        .collect();
+                    writer.add_struct(&s.name, &fields);
+                }
+                if let Item::Enum(e) = item {
+                    let variants: Vec<(&str, u64)> = e.variants.iter()
+                        .enumerate()
+                        .map(|(i, v)| (v.name.as_str(), i as u64))
+                        .collect();
+                    writer.add_enum(&e.name, &variants);
+                }
+            }
+        }
+    }
+
+    match writer.write(&libx_path) {
+        Ok(()) => println!("  packaged {}", libx_path.display()),
+        Err(e) => eprintln!("  warning: libx packaging failed: {e}"),
+    }
+}
+
 // ─── xore run ────────────────────────────────────────────────────────────────
 
 fn cmd_run(release: bool) {
@@ -364,7 +453,7 @@ fn cmd_run(release: bool) {
 
     if !output.exists() {
         println!("  note: binary not produced (missing LLVM toolchain)");
-        println!("        run `xore --ir src/main.xr` to see the generated IR");
+        println!("        run `xore --ir src/main.xre` to see the generated IR");
         return;
     }
 
@@ -547,6 +636,37 @@ fn print_stmt(stmt: &Stmt, d: usize) {
             None    => println!("{p}end();"),
             Some(c) => println!("{p}end() if {};", expr_str(c)),
         },
+        Stmt::Match(m)      => {
+            println!("{p}match {} {{", expr_str(&m.subject));
+            for arm in &m.arms {
+                let pat = match &arm.pattern {
+                    Pattern::Wildcard     => "_".to_string(),
+                    Pattern::Bind(n)      => n.clone(),
+                    Pattern::Lit(e)       => expr_str(e),
+                    Pattern::Variant(e, Some(v)) => format!("{e}.{v}"),
+                    Pattern::Variant(e, None)    => e.clone(),
+                    Pattern::Range(lo, hi) => format!("{}..{}", expr_str(lo), expr_str(hi)),
+                };
+                println!("{p}  {pat} => {{");
+                print_block(&arm.body, d + 2);
+                println!("{p}  }}");
+            }
+            println!("{p}}}");
+        }
+        Stmt::Switch(s)     => {
+            println!("{p}switch {} {{", expr_str(&s.subject));
+            for case in &s.cases {
+                println!("{p}  case {}: {{", expr_str(&case.value));
+                print_block(&case.body, d + 2);
+                println!("{p}  }}");
+            }
+            if let Some(def) = &s.default {
+                println!("{p}  default: {{");
+                print_block(def, d + 2);
+                println!("{p}  }}");
+            }
+            println!("{p}}}");
+        }
         Stmt::FnDecl(f)     => print_fn(f, d),
         Stmt::EnumDecl(e)   => print_enum(e, d),
         Stmt::StructDecl(s) => print_struct(s, d),

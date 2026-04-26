@@ -8,7 +8,7 @@
 //   [project]
 //   name    = "hello"
 //   version = "0.1.0"
-//   entry   = "src/main.xr"
+//   entry   = "src/main.xre"
 //   type    = "bin"           # bin | lib | osdev
 //
 //   [build]
@@ -154,7 +154,7 @@ impl Manifest {
             .cloned().unwrap_or_else(|| "0.1.0".into());
 
         let entry_str = proj.get("entry")
-            .cloned().unwrap_or_else(|| "src/main.xr".into());
+            .cloned().unwrap_or_else(|| "src/main.xre".into());
         let entry = root.join(&entry_str);
 
         let ty = proj.get("type")
@@ -200,10 +200,10 @@ impl Manifest {
 
 // ─── Module resolution ────────────────────────────────────────────────────────
 
-/// A source unit — either a standalone .xr or a paired .xrs/.xrb module.
+/// A source unit — either a standalone .xre or a paired .xrs/.xrb module.
 #[derive(Debug, Clone)]
 pub enum SourceUnit {
-    /// Single `.xr` file (regular code).
+    /// Single `.xre` file (regular code).
     Single(PathBuf),
     /// Critical module: must have both spec (.xrs) and body (.xrb).
     Module { spec: PathBuf, body: PathBuf, name: String },
@@ -221,7 +221,7 @@ impl SourceUnit {
 
 /// Walk `src/` and collect all source units.
 /// - Pairs `.xrs` + `.xrb` with the same stem → `SourceUnit::Module`
-/// - Lone `.xr` files → `SourceUnit::Single`
+/// - Lone `.xre` files → `SourceUnit::Single`
 /// - A `.xrs` without a `.xrb` (or vice versa) → error
 pub fn collect_sources(src_dir: &Path) -> Result<Vec<SourceUnit>, ProjectError> {
     let mut specs: HashMap<String, PathBuf> = HashMap::new();
@@ -238,7 +238,7 @@ pub fn collect_sources(src_dir: &Path) -> Result<Vec<SourceUnit>, ProjectError> 
             .unwrap_or("").to_string();
 
         match ext {
-            "xr"  => singles.push(path),
+            "xre" => singles.push(path),
             "xrs" => { specs.insert(stem, path); }
             "xrb" => { bodies.insert(stem, path); }
             _     => {}
@@ -272,7 +272,7 @@ pub fn collect_sources(src_dir: &Path) -> Result<Vec<SourceUnit>, ProjectError> 
         }
     }
 
-    // Add standalone .xr files
+    // Add standalone .xre files
     for p in singles { units.push(SourceUnit::Single(p)); }
 
     Ok(units)
@@ -390,7 +390,7 @@ pub fn scaffold_project(name: &str, root: &Path, ty: ProjectType) -> Result<(), 
 r#"[project]
 name    = "{name}"
 version = "0.1.0"
-entry   = "src/main.xr"
+entry   = "src/main.xre"
 type    = "{type_str}"
 
 [build]
@@ -402,15 +402,15 @@ optimize = "debug"
 "#);
     fs::write(root.join("xore.project"), manifest).ok();
 
-    // src/main.xr
+    // src/main.xre
     let main_xr = format!(
-r#"// {name} — main.xr
+r#"// {name} — main.xre
 
 public main() {{
     println!("Hello from {name}!");
 }}
 "#);
-    fs::write(src.join("main.xr"), main_xr).ok();
+    fs::write(src.join("main.xre"), main_xr).ok();
 
     // .gitignore
     fs::write(root.join(".gitignore"), "build/\n*.ll\n*.o\n").ok();
@@ -429,7 +429,7 @@ mod tests {
 [project]
 name    = "hello"
 version = "0.1.0"
-entry   = "src/main.xr"
+entry   = "src/main.xre"
 type    = "bin"
 
 [build]

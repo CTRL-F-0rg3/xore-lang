@@ -8,7 +8,7 @@ use crate::token::Span;
 
 // ─── Top-level ───────────────────────────────────────────────────────────────
 
-/// A fully parsed `.xr` source file.
+/// A fully parsed `.xre` source file.
 #[derive(Debug, Clone)]
 pub struct Program {
     pub items: Vec<Item>,
@@ -158,12 +158,65 @@ pub enum Stmt {
     For(ForStmt),
     /// `end() [if cond];`  — Xore-specific early-exit
     End(EndStmt),
+    /// `match expr { pattern => { block }, ... }`
+    Match(MatchStmt),
+    /// `switch expr { case val: { block } default: { block } }`
+    Switch(SwitchStmt),
     /// Inner function definition: `fn name(…) -> T { … }`
     FnDecl(FnDecl),
     /// Inner enum definition: `enum Name { … }`
     EnumDecl(EnumDecl),
     /// Inner struct definition
     StructDecl(StructDecl),
+}
+
+// ── Match ─────────────────────────────────────────────────────────────────────
+
+/// `match expr { pattern => { body }, ... }`
+#[derive(Debug, Clone)]
+pub struct MatchStmt {
+    pub subject: Expr,
+    pub arms:    Vec<MatchArm>,
+    pub span:    Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body:    Block,
+    pub span:    Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum Pattern {
+    /// Literal: `42`, `"hello"`, `True`, `False`, `None`
+    Lit(Expr),
+    /// Enum variant: `Color.Red` or just `Red`
+    Variant(String, Option<String>),
+    /// Binding: `x` — captures matched value
+    Bind(String),
+    /// Wildcard: `_`
+    Wildcard,
+    /// Range: `0..10`
+    Range(Expr, Expr),
+}
+
+// ── Switch ────────────────────────────────────────────────────────────────────
+
+/// `switch expr { case val: { body } case val2: { body } default: { body } }`
+#[derive(Debug, Clone)]
+pub struct SwitchStmt {
+    pub subject:  Expr,
+    pub cases:    Vec<SwitchCase>,
+    pub default:  Option<Block>,
+    pub span:     Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SwitchCase {
+    pub value: Expr,
+    pub body:  Block,
+    pub span:  Span,
 }
 
 #[derive(Debug, Clone)]
