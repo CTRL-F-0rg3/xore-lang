@@ -274,16 +274,21 @@ fn compile_unit(path: &Path, build_dir: &Path, manifest: &Manifest) -> Option<Pa
 
     match llc {
         Some(llc_bin) => {
-            let arch = match manifest.target {
-                Target::BareMetal => vec!["-mtriple=x86_64-unknown-none"],
-                _                 => vec![],
-            };
+            let mut llc_args = vec![
+                "-filetype=obj".to_string(),
+                opt.to_string(),
+                "-o".to_string(),
+                obj_path.to_str().unwrap_or("out.o").to_string(),
+                ll_path.to_str().unwrap_or("out.ll").to_string(),
+            ];
+            // Position-independent code for libraries
+            match manifest.ty {
+                ProjectType::Lib   => llc_args.insert(1, "-relocation-model=pic".to_string()),
+                ProjectType::Osdev => llc_args.insert(1, "-mtriple=x86_64-unknown-none".to_string()),
+                _ => {}
+            }
             let status = process::Command::new(&llc_bin)
-                .arg("-filetype=obj")
-                .arg(opt)
-                .args(&arch)
-                .arg("-o").arg(&obj_path)
-                .arg(&ll_path)
+                .args(&llc_args)
                 .status()
                 .unwrap_or_else(|e| fatal(&format!("llc: {e}")));
             if !status.success() { fatal("llc: compilation failed"); }
@@ -355,7 +360,8 @@ fn link_objects(objs: &[PathBuf], output: &Path, manifest: &Manifest) {
                     cmd.args(["-nostdlib", "-static", "-Wl,-e,_start"]);
                 }
                 ProjectType::Lib => {
-                    cmd.arg("-shared");
+                    // Shared library — position-independent code required
+                    cmd.args(["-shared", "-fPIC", "-Wl,--no-undefined"]);
                 }
                 ProjectType::Bin => {
                     cmd.arg("-no-pie");
@@ -449,6 +455,24 @@ fn package_libx(objs: &[PathBuf], manifest: &Manifest) {
 // ─── xore run ────────────────────────────────────────────────────────────────
 
 fn cmd_run(release: bool) {
+    let manifest = load_manifest();
+
+    // Libraries and osdev targets cannot be run directly
+    match manifest.ty {
+        ProjectType::Lib => {
+            eprintln!("error: `xore run` is not available for library projects (type = lib)");
+            eprintln!("hint:  use `xore build` to produce a .libx archive");
+            process::exit(1);
+        }
+        ProjectType::Osdev => {
+            eprintln!("error: `xore run` is not available for osdev projects");
+            eprintln!("hint:  use `xore build --elf` then run in QEMU:");
+            eprintln!("       qemu-system-x86_64 -kernel build/<name>.elf");
+            process::exit(1);
+        }
+        ProjectType::Bin => {}
+    }
+
     let output = cmd_build(release, false);
 
     if !output.exists() {
