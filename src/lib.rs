@@ -6,6 +6,7 @@ pub mod lexer;
 pub mod libx;
 pub mod parser;
 pub mod project;
+pub mod resolver;
 pub mod token;
 pub mod typeck;
 

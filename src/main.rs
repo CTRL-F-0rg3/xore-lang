@@ -17,8 +17,9 @@ use xore_lang::ast::*;
 use xore_lang::codegen::Codegen;
 use xore_lang::libx::LibxWriter;
 use xore_lang::project::{
-    collect_sources, scaffold_project, Manifest, OptLevel, ProjectType, SourceUnit, Target,
+    collect_sources, scaffold_project, Manifest, OptLevel, ProjectType, SourceUnit,
 };
+use xore_lang::resolver::{collect_project_symbols, SymbolTable};
 use xore_lang::typeck::TypeChecker;
 use xore_lang::{lex, parse, KeywordGroup, NumBase, TokenKind};
 
@@ -189,9 +190,7 @@ fn check_file(path: &Path) -> usize {
 fn cmd_build(release: bool, force_elf: bool) -> PathBuf {
     let mut manifest = load_manifest();
 
-    // --release overrides manifest
     if release { manifest.optimize = OptLevel::Release; }
-    // --elf overrides type
     if force_elf { manifest.ty = ProjectType::Osdev; }
 
     let src_dir   = manifest.root.join("src");
@@ -202,24 +201,32 @@ fn cmd_build(release: bool, force_elf: bool) -> PathBuf {
 
     fs::create_dir_all(&build_dir).unwrap_or_else(|e| fatal(&format!("mkdir build: {e}")));
 
+    // ── Pass 1: collect all symbols across the entire project ──────────────
+    // This must run before any file is compiled so every compilation unit
+    // can emit correct `declare` statements for cross-file calls.
+    let symbols = collect_project_symbols(&src_dir);
+    if symbols.fns.len() > 0 {
+        println!("  symbols  {} fn, {} struct, {} enum",
+            symbols.fns.len(), symbols.structs.len(), symbols.enums.len());
+    }
+
     let units = collect_sources(&src_dir)
         .unwrap_or_else(|e| fatal(&e.to_string()));
 
     let mut obj_files: Vec<PathBuf> = Vec::new();
 
+    // ── Pass 2: compile each source unit with the full symbol table ────────
     for unit in &units {
         match unit {
             SourceUnit::Single(path) => {
-                if let Some(obj) = compile_unit(path, &build_dir, &manifest) {
+                if let Some(obj) = compile_unit(path, &build_dir, &manifest, &symbols) {
                     obj_files.push(obj);
                 }
             }
             SourceUnit::Module { spec, body, name } => {
-                // For critical modules: check spec matches body signatures,
-                // then compile body.
                 println!("  module   {name}  (.xrs + .xrb)");
                 validate_module_pair(spec, body);
-                if let Some(obj) = compile_unit(body, &build_dir, &manifest) {
+                if let Some(obj) = compile_unit(body, &build_dir, &manifest, &symbols) {
                     obj_files.push(obj);
                 }
             }
@@ -229,7 +236,6 @@ fn cmd_build(release: bool, force_elf: bool) -> PathBuf {
     let output = manifest.output_path();
     link_objects(&obj_files, &output, &manifest);
 
-    // For library projects — also package as .libx
     if manifest.ty == ProjectType::Lib {
         package_libx(&obj_files, &manifest);
     }
@@ -239,7 +245,12 @@ fn cmd_build(release: bool, force_elf: bool) -> PathBuf {
 }
 
 /// Compile one source file: .xre or .xrb → LLVM IR → object file.
-fn compile_unit(path: &Path, build_dir: &Path, manifest: &Manifest) -> Option<PathBuf> {
+fn compile_unit(
+    path:      &Path,
+    build_dir: &Path,
+    manifest:  &Manifest,
+    symbols:   &SymbolTable,
+) -> Option<PathBuf> {
     let src = read_file(path.to_str().unwrap_or("?"));
     let (program, lex_errs, parse_errs) = parse(&src);
 
@@ -261,8 +272,14 @@ fn compile_unit(path: &Path, build_dir: &Path, manifest: &Manifest) -> Option<Pa
     let ll_path  = build_dir.join(format!("{stem}.ll"));
     let obj_path = build_dir.join(format!("{stem}.o"));
 
-    // Generate LLVM IR
-    let mut cg = Codegen::new(path.to_str().unwrap_or("?"));
+    // Generate LLVM IR — attach project symbol table so cross-file
+    // `declare` statements are emitted automatically.
+    let mut cg = Codegen::new(path.to_str().unwrap_or("?"))
+        .with_symbols(xore_lang::resolver::SymbolTable {
+            fns:     symbols.fns.clone(),
+            structs: symbols.structs.clone(),
+            enums:   symbols.enums.clone(),
+        });
     let ir = cg.emit_program_with_target(&program, manifest.target.llvm_triple());
 
     fs::write(&ll_path, &ir).unwrap_or_else(|e| fatal(&format!("write IR: {e}")));

@@ -16,7 +16,7 @@
 //   - We can later swap to direct x86-64 emission for a self-hosted backend
 
 use crate::ast::*;
-// ─── LLVM types ──────────────────────────────────────────────────────────────
+use crate::resolver::{SymbolTable, collect_external_refs, local_fn_names};
 
 /// Maps a Xore type name to its LLVM IR type string.
 fn llvm_type(ty: &TypeExpr) -> &'static str {
@@ -62,6 +62,9 @@ fn llvm_type_default(name: &str) -> &'static str {
 pub struct Codegen {
     /// Output IR buffer.
     out: String,
+    /// Hoisted function buffer — nested fns are collected here then flushed
+    /// before the containing function is emitted.
+    hoisted: String,
     /// Module name (derived from source filename).
     module: String,
     /// Counter for unnamed temporaries: %0, %1, %2 …
@@ -72,18 +75,28 @@ pub struct Codegen {
     strings: Vec<(String, String)>,
     /// Global string counter.
     str_cnt: u32,
+    /// Project-wide symbol table — used to emit `declare` for external fns.
+    pub symbol_table: Option<SymbolTable>,
 }
 
 impl Codegen {
     pub fn new(source_path: &str) -> Self {
         Self {
             out: String::new(),
+            hoisted: String::new(),
             module: source_path.to_string(),
             tmp: 0,
             label: 0,
             strings: Vec::new(),
             str_cnt: 0,
+            symbol_table: None,
         }
+    }
+
+    /// Attach a symbol table for cross-file resolution.
+    pub fn with_symbols(mut self, table: SymbolTable) -> Self {
+        self.symbol_table = Some(table);
+        self
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -141,7 +154,7 @@ impl Codegen {
         self.emit("");
 
         // Declare external libc functions we may need
-        self.emit("; ── external declarations ─────────────────────────────────");
+        self.emit("; ── libc declarations ─────────────────────────────────────");
         self.emit("declare i32 @printf(ptr noundef, ...)");
         self.emit("declare i32 @puts(ptr noundef)");
         self.emit("declare ptr @malloc(i64 noundef)");
@@ -150,9 +163,9 @@ impl Codegen {
         self.emit("");
 
         // Collect all items
-        let mut fns: Vec<&FnDecl>     = Vec::new();
+        let mut fns: Vec<&FnDecl>         = Vec::new();
         let mut structs: Vec<&StructDecl> = Vec::new();
-        let mut enums: Vec<&EnumDecl>   = Vec::new();
+        let mut enums: Vec<&EnumDecl>     = Vec::new();
 
         for item in &program.items {
             match item {
@@ -161,6 +174,28 @@ impl Codegen {
                 Item::Enum(e)     => enums.push(e),
                 _ => {}
             }
+        }
+
+        // ── Cross-file: declare every external function this file calls ──────
+        // Collect local fn names so we don't declare what we define here.
+        let local_names = local_fn_names(program);
+        let ext_refs    = collect_external_refs(program, &local_names);
+
+        if !ext_refs.is_empty() {
+            self.emit("; ── cross-file declarations ───────────────────────────────");
+            for name in &ext_refs {
+                // Try the project symbol table first (has exact types).
+                let decl = self.symbol_table.as_ref()
+                    .and_then(|st| st.declare_fn(name))
+                    .unwrap_or_else(|| {
+                        // Unknown function — emit a generic variadic declare.
+                        // The linker will resolve it; types will match because
+                        // Xore functions default to i64 params/return.
+                        format!("declare i64 @{name}(...)")
+                    });
+                self.emit(&decl);
+            }
+            self.emit("");
         }
 
         // Emit struct type declarations
@@ -180,6 +215,13 @@ impl Codegen {
         // Emit function definitions
         self.emit("; ── function definitions ──────────────────────────────────");
         for f in &fns { self.emit_fn(f); }
+
+        // Flush any functions hoisted from nested scopes (e.g. fn defined inside main)
+        if !self.hoisted.is_empty() {
+            self.emit("; ── hoisted nested functions ──────────────────────────────");
+            let hoisted = std::mem::take(&mut self.hoisted);
+            self.out.push_str(&hoisted);
+        }
 
         // Emit entry point trampoline if `main` exists and is not already `@main`
         let has_main = fns.iter().any(|f| f.name == "main");
@@ -325,10 +367,39 @@ impl Codegen {
             Stmt::End(e)        => self.emit_end(e, env),
             Stmt::Match(m)      => self.emit_match(m, env, ret_ty),
             Stmt::Switch(s)     => self.emit_switch(s, env, ret_ty),
-            Stmt::FnDecl(f)     => self.emit_fn(f),
-            Stmt::EnumDecl(e)   => self.emit_enum_constants(e),
-            Stmt::StructDecl(s) => self.emit_struct_type(s),
+            // Nested fn/struct/enum: hoist to module level, don't emit inline.
+            Stmt::FnDecl(f)     => self.hoist_fn(f),
+            Stmt::EnumDecl(e)   => self.hoist_enum(e),
+            Stmt::StructDecl(s) => self.hoist_struct(s),
         }
+    }
+
+    /// Emit a nested function into the hoisted buffer so it appears at module
+    /// scope in the final IR, not inside another function's body.
+    fn hoist_fn(&mut self, f: &FnDecl) {
+        let saved_out   = std::mem::take(&mut self.out);
+        let saved_tmp   = self.tmp;
+        let saved_label = self.label;
+        self.emit_fn(f);
+        let fn_ir = std::mem::replace(&mut self.out, saved_out);
+        // Restore parent counters — nested fn has its own reset inside emit_fn
+        self.tmp   = saved_tmp;
+        self.label = saved_label;
+        self.hoisted.push_str(&fn_ir);
+    }
+
+    fn hoist_struct(&mut self, s: &StructDecl) {
+        let saved = std::mem::take(&mut self.out);
+        self.emit_struct_type(s);
+        let ir = std::mem::replace(&mut self.out, saved);
+        self.hoisted.push_str(&ir);
+    }
+
+    fn hoist_enum(&mut self, e: &EnumDecl) {
+        let saved = std::mem::take(&mut self.out);
+        self.emit_enum_constants(e);
+        let ir = std::mem::replace(&mut self.out, saved);
+        self.hoisted.push_str(&ir);
     }
 
     // ── let ───────────────────────────────────────────────────────────────
@@ -651,15 +722,22 @@ impl Codegen {
 
             // ── Type constructor: i32(x), bool(True) ─────────────────────
             Expr::TypeCall { ty, args, .. } => {
+                let dst_ty = llvm_type(ty).to_string();
                 if let Some(a) = args.first() {
-                    let val = self.emit_expr(a, env);
-                    let dst_ty = llvm_type(ty);
-                    let tmp = self.tmp();
-                    // Cast / truncate / extend as needed
-                    self.emit(&format!("  {tmp} = trunc i64 {val} to {dst_ty}"));
-                    let ext = self.tmp();
-                    self.emit(&format!("  {ext} = sext {dst_ty} {tmp} to i64"));
-                    ext
+                    let val    = self.emit_expr(a, env);
+                    let src_ty = infer_expr_type(a, env);
+                    if src_ty == dst_ty {
+                        val
+                    } else {
+                        let tmp  = self.tmp();
+                        let cast = pick_cast(&src_ty, &dst_ty);
+                        if cast == "add" {
+                            val
+                        } else {
+                            self.emit(&format!("  {tmp} = {cast} {src_ty} {val} to {dst_ty}"));
+                            tmp
+                        }
+                    }
                 } else {
                     "0".into()
                 }
