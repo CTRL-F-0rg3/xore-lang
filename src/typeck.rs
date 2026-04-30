@@ -244,11 +244,12 @@ impl TypeChecker {
     fn collect_program(&mut self, program: &Program) {
         for item in &program.items {
             match item {
-                Item::Function(f)  => self.collect_fn(f),
-                Item::Struct(s)    => self.collect_struct(s),
-                Item::Enum(e)      => self.collect_enum(e),
-                Item::Mod(m)       => {
-                    // Recurse into modules
+                Item::Function(f)     => self.collect_fn(f),
+                Item::Struct(s)       => self.collect_struct(s),
+                Item::Enum(e)         => self.collect_enum(e),
+                Item::Extern(decl)    => self.collect_extern(decl),
+                Item::ExternBlock(b)  => b.decls.iter().for_each(|d| self.collect_extern(d)),
+                Item::Mod(m)          => {
                     for inner in &m.items {
                         if let Item::Function(f) = inner { self.collect_fn(f); }
                         if let Item::Struct(s)   = inner { self.collect_struct(s); }
@@ -258,6 +259,16 @@ impl TypeChecker {
                 _ => {}
             }
         }
+    }
+
+    fn collect_extern(&mut self, decl: &ExternDecl) {
+        let params = decl.params.iter()
+            .map(|p| (p.name.clone(), XoreType::from_type_expr(&p.ty)))
+            .collect();
+        let ret = decl.ret_ty.as_ref()
+            .map(XoreType::from_type_expr)
+            .unwrap_or(XoreType::Void);
+        self.fns.insert(decl.name.clone(), FnSig { params, ret, exported: true });
     }
 
     fn collect_fn(&mut self, f: &FnDecl) {
@@ -319,6 +330,11 @@ impl TypeChecker {
             Stmt::While(w) => self.check_while(w, scope, ret_ty),
             Stmt::For(f)   => self.check_for(f, scope, ret_ty),
             Stmt::End(_)   => {}
+            Stmt::Asm(_)     => {}   // asm blocks are unchecked (low-level)
+            Stmt::Syscall(s) => {
+                self.infer_expr(&s.number, scope);
+                for a in &s.args { self.infer_expr(a, scope); }
+            }
             Stmt::Match(m) => {
                 self.infer_expr(&m.subject, scope);
                 for arm in &m.arms {

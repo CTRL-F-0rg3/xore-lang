@@ -267,20 +267,44 @@ impl Parser {
     // ── Items ─────────────────────────────────────────────────────────────
 
     fn parse_item(&mut self) -> ParseResult<Item> {
-        // Check for @export annotation before visibility/fn keyword.
-        // Syntax: @export fn name(...) or @export public fn name(...)
-        let exported = if matches!(&self.peek().kind, TokenKind::Annotation(s) if s == "export") {
-            self.advance(); // consume @export
-            true
-        } else {
-            false
-        };
+        // Check for @export / @link annotations before visibility/fn keyword.
+        let mut exported = false;
+        let mut link_lib: Option<String> = None;
+
+        loop {
+            match &self.peek().kind.clone() {
+                TokenKind::Annotation(s) if s == "export" => {
+                    self.advance(); exported = true;
+                }
+                TokenKind::Annotation(s) if s == "link" => {
+                    self.advance();
+                    // optional: @link("libname")
+                    if self.eat_delim(Delim::OpenParen) {
+                        if let TokenKind::StrLit(lib) = self.peek().kind.clone() {
+                            link_lib = Some(lib);
+                            self.advance();
+                        }
+                        self.eat_delim(Delim::CloseParen);
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        // unsafe / naked modifiers
+        let unsafe_ = self.eat_kw(Keyword::Unsafe);
+        let naked    = self.eat_kw(Keyword::Naked);
 
         let vis = self.parse_visibility();
 
         match &self.peek().kind.clone() {
+            // extern fn / extern "lib" { ... }
+            TokenKind::Kw(Keyword::Extern) => {
+                self.advance();
+                return self.parse_extern_item(vis, link_lib);
+            }
             TokenKind::Kw(Keyword::Fn) => {
-                Ok(Item::Function(self.parse_fn_decl(vis, exported)?))
+                Ok(Item::Function(self.parse_fn_decl_full(vis, exported, unsafe_, naked)?))
             }
             TokenKind::Kw(Keyword::Struct) => {
                 Ok(Item::Struct(self.parse_struct(vis)?))
@@ -314,18 +338,107 @@ impl Parser {
         Visibility::Private
     }
 
+    // ── Extern declarations ───────────────────────────────────────────────
+
+    fn parse_extern_item(&mut self, _vis: Visibility, lib: Option<String>) -> ParseResult<Item> {
+        let start = self.current_span();
+
+        // extern "libname" { fn ...; fn ...; }
+        if let TokenKind::StrLit(lib_name) = self.peek().kind.clone() {
+            let lib_name = lib_name.clone();
+            self.advance();
+            self.expect_delim(Delim::OpenBrace)?;
+            let mut decls = Vec::new();
+            while !matches!(self.peek().kind, TokenKind::Delim(Delim::CloseBrace) | TokenKind::Eof) {
+                let decl = self.parse_extern_fn_decl()?;
+                decls.push(decl);
+                self.eat_punct(Punct::Semicolon);
+            }
+            self.expect_delim(Delim::CloseBrace)?;
+            return Ok(Item::ExternBlock(ExternBlock {
+                lib: Some(lib_name),
+                decls,
+                span: span_to(start, self.current_span()),
+            }));
+        }
+
+        // extern fn foo(...) -> T;
+        if matches!(self.peek().kind, TokenKind::Kw(Keyword::Fn)) {
+            let decl = self.parse_extern_fn_decl()?;
+            self.eat_punct(Punct::Semicolon);
+            return Ok(Item::Extern(decl));
+        }
+
+        // extern { fn ...; } — block without library name
+        if matches!(self.peek().kind, TokenKind::Delim(Delim::OpenBrace)) {
+            self.advance();
+            let mut decls = Vec::new();
+            while !matches!(self.peek().kind, TokenKind::Delim(Delim::CloseBrace) | TokenKind::Eof) {
+                let decl = self.parse_extern_fn_decl()?;
+                decls.push(decl);
+                self.eat_punct(Punct::Semicolon);
+            }
+            self.expect_delim(Delim::CloseBrace)?;
+            return Ok(Item::ExternBlock(ExternBlock {
+                lib,
+                decls,
+                span: span_to(start, self.current_span()),
+            }));
+        }
+
+        Err(ParseError::new("expected `fn`, `\"lib\"` or `{` after `extern`", self.current_span()))
+    }
+
+    fn parse_extern_fn_decl(&mut self) -> ParseResult<ExternDecl> {
+        let start = self.current_span();
+        self.expect_kw(Keyword::Fn)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect_delim(Delim::OpenParen)?;
+        let mut params   = Vec::new();
+        let mut variadic = false;
+
+        while !matches!(self.peek().kind, TokenKind::Delim(Delim::CloseParen) | TokenKind::Eof) {
+            // `...` varargs marker
+            if matches!(self.peek().kind, TokenKind::Op(Op::DotDotDot)) {
+                self.advance();
+                variadic = true;
+                break;
+            }
+            let pstart = self.current_span();
+            let (pname, _) = self.expect_ident()?;
+            self.expect_punct(Punct::Colon)?;
+            let ty = self.parse_type()?;
+            params.push(Param { name: pname, ty, span: span_to(pstart, self.current_span()) });
+            if !self.eat_punct(Punct::Comma) { break; }
+        }
+        self.expect_delim(Delim::CloseParen)?;
+        let ret_ty = self.parse_optional_return_type()?;
+        Ok(ExternDecl {
+            conv: CallConv::C,
+            name, params, variadic, ret_ty,
+            span: span_to(start, self.current_span()),
+        })
+    }
+
     // ── Function declarations ─────────────────────────────────────────────
 
-    /// Full form: `[@export] [public] fn name(params) [-> type] { body }`
-    fn parse_fn_decl(&mut self, vis: Visibility, exported: bool) -> ParseResult<FnDecl> {
+    fn parse_fn_decl_full(
+        &mut self, vis: Visibility, exported: bool,
+        unsafe_: bool, naked: bool,
+    ) -> ParseResult<FnDecl> {
         let start = self.current_span();
         self.expect_kw(Keyword::Fn)?;
         let (name, _) = self.expect_ident()?;
         let params = self.parse_params()?;
         let ret_ty = self.parse_optional_return_type()?;
-        let body = self.parse_block()?;
-        let span = span_to(start, self.current_span());
-        Ok(FnDecl { vis, exported, name, params, ret_ty, body, span })
+        let body   = self.parse_block()?;
+        Ok(FnDecl { vis, exported, unsafe_, naked, name, params, ret_ty, body,
+            span: span_to(start, self.current_span()) })
+    }
+
+    /// Full form: `[@export] [public] fn name(params) [-> type] { body }`
+    fn parse_fn_decl(&mut self, vis: Visibility, exported: bool) -> ParseResult<FnDecl> {
+        self.parse_fn_decl_full(vis, exported, false, false)
     }
 
     /// Short form (Xore): `[@export] public main() { body }` — no `fn` keyword
@@ -334,9 +447,9 @@ impl Parser {
         let (name, _) = self.expect_ident()?;
         let params = self.parse_params()?;
         let ret_ty = self.parse_optional_return_type()?;
-        let body = self.parse_block()?;
-        let span = span_to(start, self.current_span());
-        Ok(FnDecl { vis, exported, name, params, ret_ty, body, span })
+        let body   = self.parse_block()?;
+        Ok(FnDecl { vis, exported, unsafe_: false, naked: false, name, params, ret_ty, body,
+            span: span_to(start, self.current_span()) })
     }
 
     fn parse_params(&mut self) -> ParseResult<Vec<Param>> {
@@ -518,6 +631,9 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> ParseResult<Stmt> {
+        // unsafe block just passes through to the inner statement
+        let _unsafe = self.eat_kw(Keyword::Unsafe);
+
         match &self.peek().kind.clone() {
             TokenKind::Kw(Keyword::Let)    => self.parse_let(),
             TokenKind::Kw(Keyword::Return) => self.parse_return(),
@@ -527,18 +643,26 @@ impl Parser {
             TokenKind::Kw(Keyword::End)    => self.parse_end().map(Stmt::End),
             TokenKind::Kw(Keyword::Match)  => self.parse_match().map(Stmt::Match),
             TokenKind::Kw(Keyword::Switch) => self.parse_switch().map(Stmt::Switch),
+            // asm { "..." }
+            TokenKind::Kw(Keyword::Asm)    => self.parse_asm_stmt().map(Stmt::Asm),
+            // syscall(num, args...)
+            TokenKind::Kw(Keyword::Syscall) => self.parse_syscall_stmt().map(Stmt::Syscall),
             // Inner `fn` declaration
             TokenKind::Kw(Keyword::Fn) => {
                 let exported = false;
                 let vis = Visibility::Private;
                 Ok(Stmt::FnDecl(self.parse_fn_decl(vis, exported)?))
             }
-            // Inner `enum` declaration
+            // unsafe fn
+            TokenKind::Kw(Keyword::Unsafe) => {
+                self.advance();
+                let vis = Visibility::Private;
+                Ok(Stmt::FnDecl(self.parse_fn_decl_full(vis, false, true, false)?))
+            }
             TokenKind::Kw(Keyword::Enum) => {
                 let vis = Visibility::Private;
                 Ok(Stmt::EnumDecl(self.parse_enum(vis)?))
             }
-            // Inner `struct` declaration
             TokenKind::Kw(Keyword::Struct) => {
                 let vis = Visibility::Private;
                 Ok(Stmt::StructDecl(self.parse_struct(vis)?))
@@ -691,6 +815,7 @@ impl Parser {
 
     fn parse_pattern(&mut self) -> ParseResult<Pattern> {
         let tok = self.peek().clone();
+
         // Wildcard: _
         if let TokenKind::Ident(ref name) = tok.kind {
             if name == "_" {
@@ -698,23 +823,40 @@ impl Parser {
                 return Ok(Pattern::Wildcard);
             }
         }
-        // Binding or variant: name or EnumName.Variant
+
+        // Binding or Enum.Variant
         if let TokenKind::Ident(ref name) = tok.kind {
             let name = name.clone();
             self.advance();
-            // Check for Enum.Variant pattern
             if self.eat_op(Op::Dot) {
                 let (variant, _) = self.expect_ident()?;
                 return Ok(Pattern::Variant(name, Some(variant)));
             }
-            // Could be a binding (lowercase) or a variant (uppercase first char)
             let is_variant = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
             if is_variant {
                 return Ok(Pattern::Variant(name, None));
             }
             return Ok(Pattern::Bind(name));
         }
-        // Literal pattern
+
+        // Numeric literal — may be range: 10..20 or just 10
+        if let TokenKind::IntLit { value, .. } = &tok.kind {
+            let lo_val = *value;
+            let lo_span = tok.span;
+            self.advance();
+            if self.eat_op(Op::DotDot) {
+                // Range pattern: lo..hi
+                let hi = self.parse_primary()?;
+                return Ok(Pattern::Range(
+                    Expr::IntLit { value: lo_val, span: lo_span },
+                    hi,
+                ));
+            }
+            // Plain literal
+            return Ok(Pattern::Lit(Expr::IntLit { value: lo_val, span: lo_span }));
+        }
+
+        // Boolean / None literals and other exprs
         let expr = self.parse_expr()?;
         Ok(Pattern::Lit(expr))
     }
@@ -772,6 +914,85 @@ impl Parser {
     }
 
     // ── Expression statement ──────────────────────────────────────────────
+
+    // ── asm { } ───────────────────────────────────────────────────────────
+    // Syntax:
+    //   asm { "mov rax, 60\nsyscall\n" }
+    //   asm volatile { "template" : "=r"(out) : "a"(in) : "memory" }
+
+    fn parse_asm_stmt(&mut self) -> ParseResult<AsmBlock> {
+        let start = self.current_span();
+        self.expect_kw(Keyword::Asm)?;
+        let volatile_ = self.eat_kw(Keyword::Volatile);
+        self.expect_delim(Delim::OpenBrace)?;
+
+        // Template string
+        let template = match &self.peek().kind.clone() {
+            TokenKind::StrLit(s) => { let s = s.clone(); self.advance(); s }
+            _ => return Err(ParseError::new("expected asm template string", self.current_span())),
+        };
+
+        let mut outputs  = Vec::new();
+        let mut inputs   = Vec::new();
+        let mut clobbers = Vec::new();
+
+        // Optional constraint sections separated by `:`
+        // asm { "tmpl" : outputs : inputs : clobbers }
+        if self.eat_punct(Punct::Colon) {
+            outputs = self.parse_asm_constraints()?;
+            if self.eat_punct(Punct::Colon) {
+                inputs = self.parse_asm_constraints()?;
+                if self.eat_punct(Punct::Colon) {
+                    clobbers = self.parse_asm_clobbers()?;
+                }
+            }
+        }
+
+        self.expect_delim(Delim::CloseBrace)?;
+        Ok(AsmBlock { template, outputs, inputs, clobbers, volatile_, span: span_to(start, self.current_span()) })
+    }
+
+    fn parse_asm_constraints(&mut self) -> ParseResult<Vec<AsmConstraint>> {
+        let mut constraints = Vec::new();
+        while matches!(self.peek().kind, TokenKind::StrLit(_)) {
+            let constraint = if let TokenKind::StrLit(s) = &self.peek().kind.clone() {
+                let s = s.clone(); self.advance(); s
+            } else { break };
+            self.expect_delim(Delim::OpenParen)?;
+            let expr = self.parse_expr()?;
+            self.expect_delim(Delim::CloseParen)?;
+            constraints.push(AsmConstraint { constraint, expr });
+            if !self.eat_punct(Punct::Comma) { break; }
+        }
+        Ok(constraints)
+    }
+
+    fn parse_asm_clobbers(&mut self) -> ParseResult<Vec<String>> {
+        let mut clobbers = Vec::new();
+        while let TokenKind::StrLit(s) = &self.peek().kind.clone() {
+            clobbers.push(s.clone());
+            self.advance();
+            if !self.eat_punct(Punct::Comma) { break; }
+        }
+        Ok(clobbers)
+    }
+
+    // ── syscall ───────────────────────────────────────────────────────────
+    // Syntax: syscall(num, arg0, arg1, ...)
+
+    fn parse_syscall_stmt(&mut self) -> ParseResult<SyscallStmt> {
+        let start = self.current_span();
+        self.expect_kw(Keyword::Syscall)?;
+        self.expect_delim(Delim::OpenParen)?;
+        let number = self.parse_expr()?;
+        let mut args = Vec::new();
+        while self.eat_punct(Punct::Comma) {
+            args.push(self.parse_expr()?);
+        }
+        self.expect_delim(Delim::CloseParen)?;
+        self.eat_punct(Punct::Semicolon);
+        Ok(SyscallStmt { number, args, span: span_to(start, self.current_span()) })
+    }
 
     fn parse_expr_stmt(&mut self) -> ParseResult<Stmt> {
         let e = self.parse_expr()?;
@@ -1322,5 +1543,3 @@ public main(){
         assert_eq!(prog.items.len(), 1, "should produce 1 top-level item");
     }
 }
-
-//TODO  multi file 

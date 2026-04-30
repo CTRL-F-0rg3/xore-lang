@@ -604,11 +604,28 @@ fn ind(d: usize) -> String { "  ".repeat(d) }
 
 fn print_item(item: &Item, d: usize) {
     match item {
-        Item::Function(f) => print_fn(f, d),
-        Item::Struct(s)   => print_struct(s, d),
-        Item::Enum(e)     => print_enum(e, d),
-        Item::Import(i)   => println!("{}import {}", ind(d), i.path.join(".")),
-        Item::Use(u)      => println!("{}use {}",    ind(d), u.path.join(".")),
+        Item::Function(f)    => print_fn(f, d),
+        Item::Struct(s)      => print_struct(s, d),
+        Item::Enum(e)        => print_enum(e, d),
+        Item::Import(i)      => println!("{}import {}", ind(d), i.path.join(".")),
+        Item::Use(u)         => println!("{}use {}",    ind(d), u.path.join(".")),
+        Item::Extern(decl)   => {
+            let ret = decl.ret_ty.as_ref().map(|t| format!(" -> {}", type_str(t))).unwrap_or_default();
+            let params: Vec<String> = decl.params.iter().map(|p| format!("{}: {}", p.name, type_str(&p.ty))).collect();
+            let va = if decl.variadic { ", ..." } else { "" };
+            println!("{}extern fn {}({}{}){};", ind(d), decl.name, params.join(", "), va, ret);
+        }
+        Item::ExternBlock(b) => {
+            let lib = b.lib.as_deref().unwrap_or("?");
+            println!("{}extern \"{lib}\" {{", ind(d));
+            for decl in &b.decls {
+                let ret = decl.ret_ty.as_ref().map(|t| format!(" -> {}", type_str(t))).unwrap_or_default();
+                let params: Vec<String> = decl.params.iter().map(|p| format!("{}: {}", p.name, type_str(&p.ty))).collect();
+                let va = if decl.variadic { ", ..." } else { "" };
+                println!("{}  fn {}({}{}){};", ind(d), decl.name, params.join(", "), va, ret);
+            }
+            println!("{}}}", ind(d));
+        }
         Item::Mod(m) => {
             println!("{}mod {} {{", ind(d), m.name);
             for i in &m.items { print_item(i, d + 1); }
@@ -618,12 +635,14 @@ fn print_item(item: &Item, d: usize) {
 }
 
 fn print_fn(f: &FnDecl, d: usize) {
-    let exp = if f.exported { "@export " } else { "" };
-    let vis = vis_str(&f.vis);
-    let ret = f.ret_ty.as_ref().map(|t| format!(" -> {}", type_str(t))).unwrap_or_default();
+    let exp     = if f.exported { "@export " } else { "" };
+    let vis     = vis_str(&f.vis);
+    let unsafe_ = if f.unsafe_ { "unsafe " } else { "" };
+    let naked   = if f.naked   { "naked " }  else { "" };
+    let ret     = f.ret_ty.as_ref().map(|t| format!(" -> {}", type_str(t))).unwrap_or_default();
     let params: Vec<String> = f.params.iter()
         .map(|p| format!("{}: {}", p.name, type_str(&p.ty))).collect();
-    println!("{}{}{}fn {}({}){} {{", ind(d), exp, vis, f.name, params.join(", "), ret);
+    println!("{}{}{}{}{}fn {}({}){} {{", ind(d), exp, vis, unsafe_, naked, f.name, params.join(", "), ret);
     print_block(&f.body, d + 1);
     println!("{}}}", ind(d));
 }
@@ -677,6 +696,11 @@ fn print_stmt(stmt: &Stmt, d: usize) {
             None    => println!("{p}end();"),
             Some(c) => println!("{p}end() if {};", expr_str(c)),
         },
+        Stmt::Asm(a)        => println!("{p}asm {{ {:?} }}", a.template),
+        Stmt::Syscall(s)    => {
+            let args: Vec<_> = s.args.iter().map(expr_str).collect();
+            println!("{p}syscall({}, {});", expr_str(&s.number), args.join(", "));
+        }
         Stmt::Match(m)      => {
             println!("{p}match {} {{", expr_str(&m.subject));
             for arm in &m.arms {

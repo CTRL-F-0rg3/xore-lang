@@ -153,13 +153,33 @@ impl Codegen {
         self.emit(&format!("target triple = \"{triple}\""));
         self.emit("");
 
-        // Declare external libc functions we may need
+        // Collect user-declared extern names to avoid duplicate declarations
+        let mut user_extern_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for item in &program.items {
+            match item {
+                Item::Extern(d)      => { user_extern_names.insert(d.name.clone()); }
+                Item::ExternBlock(b) => b.decls.iter().for_each(|d| { user_extern_names.insert(d.name.clone()); }),
+                _ => {}
+            }
+        }
+
+        // Declare external libc functions we may need (skip if user declared them)
         self.emit("; ── libc declarations ─────────────────────────────────────");
-        self.emit("declare i32 @printf(ptr noundef, ...)");
-        self.emit("declare i32 @puts(ptr noundef)");
-        self.emit("declare ptr @malloc(i64 noundef)");
-        self.emit("declare void @free(ptr noundef)");
-        self.emit("declare void @exit(i32 noundef)");
+        if !user_extern_names.contains("printf") {
+            self.emit("declare i32 @printf(ptr noundef, ...)");
+        }
+        if !user_extern_names.contains("puts") {
+            self.emit("declare i32 @puts(ptr noundef)");
+        }
+        if !user_extern_names.contains("malloc") {
+            self.emit("declare ptr @malloc(i64 noundef)");
+        }
+        if !user_extern_names.contains("free") {
+            self.emit("declare void @free(ptr noundef)");
+        }
+        if !user_extern_names.contains("exit") {
+            self.emit("declare void @exit(i32 noundef)");
+        }
         self.emit("");
 
         // Collect all items
@@ -176,7 +196,33 @@ impl Codegen {
             }
         }
 
-        // ── Cross-file: declare every external function this file calls ──────
+        // ── Extern block declarations → LLVM declare ─────────────────────
+        let mut has_extern = false;
+        for item in &program.items {
+            match item {
+                Item::Extern(decl) => {
+                    if !has_extern {
+                        self.emit("; ── extern (FFI) declarations ─────────────────────────────");
+                        has_extern = true;
+                    }
+                    self.emit(&extern_decl_to_llvm(decl));
+                }
+                Item::ExternBlock(block) => {
+                    if !has_extern {
+                        self.emit("; ── extern (FFI) declarations ─────────────────────────────");
+                        has_extern = true;
+                    }
+                    if let Some(lib) = &block.lib {
+                        self.emit(&format!("; link: {lib}"));
+                    }
+                    for decl in &block.decls {
+                        self.emit(&extern_decl_to_llvm(decl));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if has_extern { self.emit(""); }
         // Collect local fn names so we don't declare what we define here.
         let local_names = local_fn_names(program);
         let ext_refs    = collect_external_refs(program, &local_names);
@@ -184,15 +230,11 @@ impl Codegen {
         if !ext_refs.is_empty() {
             self.emit("; ── cross-file declarations ───────────────────────────────");
             for name in &ext_refs {
-                // Try the project symbol table first (has exact types).
+                // Skip if user already declared it via extern block
+                if user_extern_names.contains(name) { continue; }
                 let decl = self.symbol_table.as_ref()
                     .and_then(|st| st.declare_fn(name))
-                    .unwrap_or_else(|| {
-                        // Unknown function — emit a generic variadic declare.
-                        // The linker will resolve it; types will match because
-                        // Xore functions default to i64 params/return.
-                        format!("declare i64 @{name}(...)")
-                    });
+                    .unwrap_or_else(|| format!("declare i64 @{name}(...)"));
                 self.emit(&decl);
             }
             self.emit("");
@@ -367,6 +409,8 @@ impl Codegen {
             Stmt::End(e)        => self.emit_end(e, env),
             Stmt::Match(m)      => self.emit_match(m, env, ret_ty),
             Stmt::Switch(s)     => self.emit_switch(s, env, ret_ty),
+            Stmt::Asm(a)        => self.emit_asm(a, env),
+            Stmt::Syscall(s)    => { self.emit_syscall(s, env); }
             // Nested fn/struct/enum: hoist to module level, don't emit inline.
             Stmt::FnDecl(f)     => self.hoist_fn(f),
             Stmt::EnumDecl(e)   => self.hoist_enum(e),
@@ -684,6 +728,18 @@ impl Codegen {
 
             // ── Function call ─────────────────────────────────────────────
             Expr::Call { callee, args, .. } => {
+                // Special case: syscall(...) called as expression
+                if let Expr::Ident { name, .. } = callee.as_ref() {
+                    if name == "syscall" {
+                        if let Some(num_expr) = args.first() {
+                            let num  = num_expr.clone();
+                            let rest = args[1..].to_vec();
+                            let span = crate::token::Span::new(0, 0, 0, 0);
+                            let fake_stmt = SyscallStmt { number: num, args: rest, span };
+                            return self.emit_syscall(&fake_stmt, env);
+                        }
+                    }
+                }
                 let fn_name = match callee.as_ref() {
                     Expr::Ident { name, .. } => {
                         if name == "main" { "xore_main".to_string() } else { name.clone() }
@@ -708,15 +764,32 @@ impl Codegen {
                         format!("({v})")
                     }
                 };
-                let arg_vals: Vec<String> = args.iter()
-                    .map(|a| {
-                        let ty = infer_expr_type(a, env);
-                        let v  = self.emit_expr(a, env);
-                        format!("{ty} {v}")
+                // Build args — use exact types from symbol table if available
+                let ret_type = self.symbol_table.as_ref()
+                    .and_then(|st| st.fns.get(&fn_name))
+                    .map(|sym| sym.ret_ty.clone())
+                    .unwrap_or_else(|| "i64".into());
+
+                let param_types: Vec<String> = self.symbol_table.as_ref()
+                    .and_then(|st| st.fns.get(&fn_name))
+                    .map(|sym| sym.params.iter().map(|p| p.ty.clone()).collect())
+                    .unwrap_or_default();
+
+                let arg_vals: Vec<String> = args.iter().enumerate()
+                    .map(|(idx, a)| {
+                        let inferred = infer_expr_type(a, env);
+                        let declared = param_types.get(idx).map(|s| s.as_str()).unwrap_or(&inferred);
+                        let v = self.emit_expr(a, env);
+                        // intern_string returns "ptr @.strN" — already typed
+                        if v.starts_with("ptr ") || v == "null" {
+                            v
+                        } else {
+                            format!("{declared} {v}")
+                        }
                     })
                     .collect();
                 let tmp = self.tmp();
-                self.emit(&format!("  {tmp} = call i64 @{fn_name}({})", arg_vals.join(", ")));
+                self.emit(&format!("  {tmp} = call {ret_type} @{fn_name}({})", arg_vals.join(", ")));
                 tmp
             }
 
@@ -1139,4 +1212,104 @@ fn llvm_escape_string(s: &str) -> String {
         }
     }
     out
+}
+
+// ─── emit_asm / emit_syscall / extern_decl helpers ───────────────────────────
+// (methods are added directly to Codegen via separate impl block)
+
+impl Codegen {
+    pub fn emit_asm(&mut self, a: &AsmBlock, env: &mut FnEnv) {
+        let vol = if a.volatile_ { " volatile" } else { " sideeffect" };
+
+        if a.inputs.is_empty() && a.outputs.is_empty() {
+            let escaped = llvm_escape_string(&a.template);
+            self.emit(&format!(
+                "  call void asm{vol} \"{escaped}\", \"~{{dirflag}},~{{fpsr}},~{{flags}}\"()"
+            ));
+            return;
+        }
+
+        let mut cparts: Vec<String> = Vec::new();
+        for o in &a.outputs  { cparts.push(format!("={}", o.constraint)); }
+        for i in &a.inputs   { cparts.push(format!("{{{}}}", i.constraint)); }
+        for c in &a.clobbers { cparts.push(format!("~{{{c}}}")); }
+
+        let mut arg_vals: Vec<String> = Vec::new();
+        for inp in &a.inputs {
+            let ty  = infer_expr_type(&inp.expr, env);
+            let val = self.emit_expr(&inp.expr, env);
+            arg_vals.push(format!("{ty} {val}"));
+        }
+
+        let escaped = llvm_escape_string(&a.template);
+        self.emit(&format!(
+            "  call void asm{vol} \"{escaped}\", \"{}\"({})",
+            cparts.join(","), arg_vals.join(", ")
+        ));
+    }
+
+    /// Emit a Linux x86-64 syscall and return the SSA result value name.
+    pub fn emit_syscall(&mut self, s: &SyscallStmt, env: &mut FnEnv) -> String {
+        let num = self.emit_expr(&s.number, env);
+        let regs = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
+
+        let mut cparts = vec![
+            "={rax}".to_string(),
+            "{rax}".to_string(),
+        ];
+        let mut arg_vals: Vec<String> = vec![format!("i64 {num}")];
+
+        for (i, arg) in s.args.iter().take(6).enumerate() {
+            let ty  = infer_expr_type(arg, env);
+            let val = self.emit_expr(arg, env);
+            // All syscall args must be i64
+            let i64val = if ty == "i64" {
+                val
+            } else if ty == "ptr" {
+                // ptr → i64 via ptrtoint — but intern_string returns "ptr @.strN"
+                // so we need to load it into a register first
+                let t = self.tmp();
+                if val.starts_with("ptr ") {
+                    // already has type prefix — extract just the value
+                    let val_only = val.trim_start_matches("ptr ").trim();
+                    self.emit(&format!("  {t} = ptrtoint ptr {val_only} to i64"));
+                } else {
+                    self.emit(&format!("  {t} = ptrtoint ptr {val} to i64"));
+                }
+                t
+            } else {
+                let t = self.tmp();
+                let cast = pick_cast(&ty, "i64");
+                if cast != "add" {
+                    self.emit(&format!("  {t} = {cast} {ty} {val} to i64"));
+                    t
+                } else {
+                    val
+                }
+            };
+            cparts.push(format!("{{{}}}", regs[i]));
+            arg_vals.push(format!("i64 {i64val}"));
+        }
+
+        cparts.extend(["~{rcx}".into(), "~{r11}".into(), "~{memory}".into()]);
+        let ret = self.tmp();
+        self.emit(&format!(
+            "  {ret} = call i64 asm sideeffect \"syscall\", \"{}\"({})",
+            cparts.join(","), arg_vals.join(", ")
+        ));
+        ret
+    }
+}  // end impl Codegen (asm/syscall block)
+
+/// Convert an ExternDecl to an LLVM `declare` statement.
+pub fn extern_decl_to_llvm(decl: &ExternDecl) -> String {
+    use crate::resolver::type_to_llvm;
+    let ret = decl.ret_ty.as_ref()
+        .map(|t| type_to_llvm(t))
+        .unwrap_or_else(|| "void".into());
+    let mut params: Vec<String> = decl.params.iter()
+        .map(|p| format!("{} noundef", type_to_llvm(&p.ty)))
+        .collect();
+    if decl.variadic { params.push("...".into()); }
+    format!("declare {} @{}({})", ret, decl.name, params.join(", "))
 }

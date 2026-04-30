@@ -99,7 +99,35 @@ impl SymbolTable {
                     name: e.name.clone(), variants, source: source.to_path_buf(),
                 });
             }
-            Item::Mod(m) => m.items.iter().for_each(|i| self.collect_item(i, source)),
+            Item::Extern(d) => {
+                // Extern functions are visible as call targets
+                let params = d.params.iter().map(|p| ParamSig {
+                    name: p.name.clone(),
+                    ty:   type_to_llvm(&p.ty),
+                }).collect();
+                let ret_ty = d.ret_ty.as_ref()
+                    .map(|t| type_to_llvm(t))
+                    .unwrap_or_else(|| "void".into());
+                self.fns.insert(d.name.clone(), FnSymbol {
+                    name: d.name.clone(), params, ret_ty,
+                    exported: true, source: source.to_path_buf(),
+                });
+            }
+            Item::ExternBlock(b) => {
+                for d in &b.decls {
+                    let params = d.params.iter().map(|p| ParamSig {
+                        name: p.name.clone(),
+                        ty:   type_to_llvm(&p.ty),
+                    }).collect();
+                    let ret_ty = d.ret_ty.as_ref()
+                        .map(|t| type_to_llvm(t))
+                        .unwrap_or_else(|| "void".into());
+                    self.fns.insert(d.name.clone(), FnSymbol {
+                        name: d.name.clone(), params, ret_ty,
+                        exported: true, source: source.to_path_buf(),
+                    });
+                }
+            }
             _ => {}
         }
     }

@@ -24,6 +24,10 @@ pub enum Item {
     Import(ImportDecl),
     Use(UseDecl),
     Mod(ModDecl),
+    /// `extern fn foo(a: i32) -> i32;` — foreign function declaration (C/Rust/Zig ABI)
+    Extern(ExternDecl),
+    /// `extern "libname" { fn ... }` — extern block with optional lib link
+    ExternBlock(ExternBlock),
 }
 
 // ─── Visibility ──────────────────────────────────────────────────────────────
@@ -66,6 +70,8 @@ pub enum TypeExpr {
 pub struct FnDecl {
     pub vis:      Visibility,
     pub exported: bool,      // @export annotation present
+    pub unsafe_:  bool,      // unsafe fn
+    pub naked:    bool,      // naked fn  (no prologue/epilogue)
     pub name:     String,
     pub params:   Vec<Param>,
     pub ret_ty:   Option<TypeExpr>,
@@ -78,6 +84,68 @@ pub struct Param {
     pub name:  String,
     pub ty:    TypeExpr,
     pub span:  Span,
+}
+
+// ─── Calling conventions ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallConv {
+    /// C ABI — System V AMD64 (Linux/macOS) or Microsoft x64 (Windows).
+    /// Compatible with C, Rust (extern "C"), Zig (@cImport / extern).
+    C,
+    /// Xore's own ABI (currently identical to C on x86-64).
+    Xore,
+}
+
+impl Default for CallConv {
+    fn default() -> Self { Self::C }
+}
+
+// ─── Extern declarations ─────────────────────────────────────────────────────
+
+/// Single extern function: `extern fn printf(fmt: ptr, ...) -> i32;`
+#[derive(Debug, Clone)]
+pub struct ExternDecl {
+    pub conv:     CallConv,
+    pub name:     String,
+    pub params:   Vec<Param>,
+    pub variadic: bool,       // C varargs: `...`
+    pub ret_ty:   Option<TypeExpr>,
+    pub span:     Span,
+}
+
+/// Extern block with optional library name:
+/// ```xre
+/// extern "libc" {
+///     fn malloc(size: usize) -> ptr;
+///     fn free(p: ptr) -> void;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ExternBlock {
+    pub lib:   Option<String>,   // library name for @link, e.g. "libc", "myrust"
+    pub decls: Vec<ExternDecl>,
+    pub span:  Span,
+}
+
+// ─── Inline assembly ──────────────────────────────────────────────────────────
+
+/// `asm { "instruction\n" : outputs : inputs : clobbers }`
+/// Also handles naked assembly bodies.
+#[derive(Debug, Clone)]
+pub struct AsmBlock {
+    pub template:  String,                      // assembly template string
+    pub outputs:   Vec<AsmConstraint>,
+    pub inputs:    Vec<AsmConstraint>,
+    pub clobbers:  Vec<String>,
+    pub volatile_: bool,
+    pub span:      Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsmConstraint {
+    pub constraint: String,    // e.g. "=r", "a", "D"
+    pub expr:       Expr,
 }
 
 // ─── Struct / Enum ───────────────────────────────────────────────────────────
@@ -162,6 +230,10 @@ pub enum Stmt {
     Match(MatchStmt),
     /// `switch expr { case val: { block } default: { block } }`
     Switch(SwitchStmt),
+    /// `asm { "..." }` — inline assembly
+    Asm(AsmBlock),
+    /// `syscall(num, arg...)` — direct Linux syscall
+    Syscall(SyscallStmt),
     /// Inner function definition: `fn name(…) -> T { … }`
     FnDecl(FnDecl),
     /// Inner enum definition: `enum Name { … }`
@@ -359,4 +431,16 @@ pub enum AssignOp {
     XorAssign,    // ^=
     ShlAssign,    // <<=
     ShrAssign,    // >>=
+}
+
+// ─── Syscall statement ────────────────────────────────────────────────────────
+
+/// `syscall(num, arg0, arg1, ...)`
+/// On Linux x86-64: syscall number in rax, args in rdi rsi rdx r10 r8 r9.
+/// Returns the result (i64) which can be stored: `let ret = syscall(1, ...);`
+#[derive(Debug, Clone)]
+pub struct SyscallStmt {
+    pub number: Expr,
+    pub args:   Vec<Expr>,
+    pub span:   Span,
 }
