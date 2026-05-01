@@ -60,22 +60,17 @@ fn llvm_type_default(name: &str) -> &'static str {
 // ─── Codegen context ─────────────────────────────────────────────────────────
 
 pub struct Codegen {
-    /// Output IR buffer.
     out: String,
-    /// Hoisted function buffer — nested fns are collected here then flushed
-    /// before the containing function is emitted.
     hoisted: String,
-    /// Module name (derived from source filename).
     module: String,
-    /// Counter for unnamed temporaries: %0, %1, %2 …
     tmp: u32,
-    /// Counter for basic-block labels.
     label: u32,
-    /// String literal pool: (content, global_name)
+    /// Monotonically increasing counter for alloca names — prevents
+    /// duplicate LLVM slot names when the same variable name appears
+    /// in multiple scopes (e.g. `for in n` and `let n = ...`).
+    alloc_cnt: u32,
     strings: Vec<(String, String)>,
-    /// Global string counter.
     str_cnt: u32,
-    /// Project-wide symbol table — used to emit `declare` for external fns.
     pub symbol_table: Option<SymbolTable>,
 }
 
@@ -87,6 +82,7 @@ impl Codegen {
             module: source_path.to_string(),
             tmp: 0,
             label: 0,
+            alloc_cnt: 0,
             strings: Vec::new(),
             str_cnt: 0,
             symbol_table: None,
@@ -133,8 +129,21 @@ impl Codegen {
     }
 
     fn reset_locals(&mut self) {
-        self.tmp = 0;
-        self.label = 0;
+        self.tmp       = 0;
+        self.label     = 0;
+        self.alloc_cnt = 0;
+    }
+
+    /// Allocate a unique LLVM slot name for a Xore variable.
+    /// Returns the slot name (without %) and increments alloc_cnt.
+    fn alloc_slot(&mut self, name: &str) -> String {
+        let n = self.alloc_cnt;
+        self.alloc_cnt += 1;
+        if n == 0 {
+            name.to_string()   // first occurrence keeps the clean name
+        } else {
+            format!("{name}.{n}")   // subsequent: n.1, n.2, ...
+        }
     }
 
     // ── Top-level emission ────────────────────────────────────────────────
@@ -449,17 +458,30 @@ impl Codegen {
     // ── let ───────────────────────────────────────────────────────────────
 
     fn emit_let(&mut self, l: &LetStmt, env: &mut FnEnv) {
-        // Determine LLVM type — prefer declared type, then infer from init
         let declared = l.ty.as_ref().map(|t| llvm_type(t).to_string());
-        let init_ty  = l.init.as_ref().map(|e| infer_expr_type(e, env).to_string());
-        let ty = declared.or(init_ty).unwrap_or_else(|| "i64".to_string());
 
-        self.emit(&format!("  %{} = alloca {ty}, align 8", l.name));
-        env.declare(&l.name, &l.name, &ty);
-
-        if let Some(init) = &l.init {
+        // IMPORTANT: evaluate the initialiser BEFORE declaring the new slot.
+        // This handles shadowing correctly: `let n = n + 1` should read the
+        // *outer* n, not the new n being declared.
+        let init_result: Option<(String, String)> = if let Some(init) = &l.init {
             let val = self.emit_expr(init, env);
-            self.emit(&format!("  store {ty} {val}, ptr %{}, align 8", l.name));
+            let ty  = infer_expr_type(init, env);
+            Some((val, ty))
+        } else {
+            None
+        };
+
+        let ty = declared
+            .or_else(|| init_result.as_ref().map(|(_, t)| t.clone()))
+            .unwrap_or_else(|| "i64".to_string());
+
+        // Now declare the new slot — after init is already in SSA form
+        let slot = self.alloc_slot(&l.name);
+        self.emit(&format!("  %{slot} = alloca {ty}, align 8"));
+        env.declare(&l.name, &slot, &ty);
+
+        if let Some((val, _)) = init_result {
+            self.emit(&format!("  store {ty} {val}, ptr %{slot}, align 8"));
         }
     }
 
@@ -544,25 +566,24 @@ impl Codegen {
     // ── for in range ──────────────────────────────────────────────────────
 
     fn emit_for(&mut self, f: &ForStmt, env: &mut FnEnv, ret_ty: &str) {
-        let _init_lbl = self.label("for_init");
         let cond_lbl = self.label("for_cond");
         let body_lbl = self.label("for_body");
         let end_lbl  = self.label("for_end");
 
         env.push_loop(&end_lbl);
 
-        // Allocate loop variable
-        self.emit(&format!("  %{} = alloca i64, align 8", f.var));
-        env.declare(&f.var, &f.var, "i64");
-        self.emit(&format!("  store i64 0, ptr %{}, align 8", f.var));
+        // Unique slot for the loop variable
+        let var_slot = self.alloc_slot(&f.var);
+        self.emit(&format!("  %{var_slot} = alloca i64, align 8"));
+        env.declare(&f.var, &var_slot, "i64");
+        self.emit(&format!("  store i64 0, ptr %{var_slot}, align 8"));
 
         self.emit(&format!("  br label %{cond_lbl}"));
 
-        // Condition: i < limit
+        // Condition: var < limit
         self.emit(&format!("{cond_lbl}:"));
         let limit_val = self.emit_expr(&f.limit, env);
-        let cur = self.tmp();
-        let var_slot = f.var.clone();
+        let cur       = self.tmp();
         self.emit(&format!("  {cur} = load i64, ptr %{var_slot}, align 8"));
         let cond = self.tmp();
         self.emit(&format!("  {cond} = icmp slt i64 {cur}, {limit_val}"));
@@ -571,6 +592,7 @@ impl Codegen {
         // Body
         self.emit(&format!("{body_lbl}:"));
         self.emit_block(&f.body, env, ret_ty);
+
         // Increment
         let cur2 = self.tmp();
         self.emit(&format!("  {cur2} = load i64, ptr %{var_slot}, align 8"));
